@@ -10,8 +10,11 @@
 // Version 0.0.1 (8.3.2023)
 //  - basic framework
 //  - commands ?, V, T, X work, I and # are just there for show
+//
+// Version 0.1.0 (8.3.2023)
+//  - command U (print UTC time), and D (wait for sync with DCF77) work now
 
-#define VERSION "0.0.1"
+#define VERSION "0.1.0"
 #define BAUD 19200
 //#define DEBUG
 
@@ -53,16 +56,15 @@
 
 #define MAXRTC 13
 
-DS1307 rtc0;
-DS1337 rtc1;
-DS3231 rtc2; // SN version
-DS3231 rtc3; // M  version
-MCP79410 rtc4;
-PCF8523 rtc5;
-PCF8563 rtc6;
-RS5C372 rtc7;
-RV3028 rtc8;
-RV3028U rtc9;
+DS1307 rtc1;
+DS1337 rtc2;
+DS3231 rtc3; // SN version
+DS3231 rtc4; // M  version
+MCP79410 rtc5;
+PCF8523 rtc6;
+PCF8563 rtc7;
+RS5C372 rtc8;
+RV3028 rtc9;
 RV3032 rtc10;
 RV8523 rtc11;
 RV8803 rtc12;
@@ -76,10 +78,12 @@ typedef struct {
 } RTCentry_t;
 
 RTCentry_t rtcentry[MAXRTC] = {
-  { &rtc0, 0, 0, 0 }
+  { &rtc1, 0, 0, 0 }
 };
 
 OneWire ds(TEMP_PIN);
+
+DCF77 dcf = DCF77(DCF_PIN, DCF_IRQ, false);
 
 bool synced = false;
 unsigned long syncstart = 0;
@@ -111,13 +115,21 @@ void loop(void) {
   case 'H':
     help();
     break;
+  case 'D':
+    if (waitForDCF77()) {
+      Serial.println(F("Synced with DCF77"));
+    } else {
+      Serial.println(F("Sync with DCF77 impossible"));
+    }
+    lastinput = millis();
+    break;
   case 'I':
     EEPROM.get(0,magic);
     if (magic != MAGIC) {
       initialize(); // only possible if magic not set in EEPROM
       EEPROM.put(0,MAGIC);
     } else {
-      Serial.println(F("Already initialized! Clear fist with '#'"));
+      Serial.println(F("Already initialized! Clear first with '#'"));
     }
     break;
   case '#':
@@ -134,15 +146,18 @@ void loop(void) {
       Serial.println(F("System has been un-initialized!"));
     } else Serial.println(F("Nothing done"));
     break;
+  case 'T':
+    Serial.print(F("Current temperature: "));
+    Serial.println(temperature());
+    break; 
+  case 'U':
+    printTime(now()); printDate(now()); Serial.println(F(" UTC"));
+    break;
   case 'V':
     Serial.print(F("Supply voltage: "));
     Serial.print(Vcc::measure(500,INTREF));
     Serial.println(F(" mV"));
     break;
-  case 'T':
-    Serial.print(F("Current temperature: "));
-    Serial.println(temperature());
-    break; 
   case 'X':
     process();
     // we do not return here
@@ -155,15 +170,16 @@ void loop(void) {
 
 void help(void) {
   Serial.println(F("H,?  - Help\n\r"
-		   "I    - Initialize system\n\r"
-		   "#    - Prepare for reinitializing the system\n\r"
-		   //		   "L    - show log so far\n\r"
-		   //		   "D    - wait for sync with DCF\n\r"
 		   //		   "C    - show current state of clocks\n\r"
-		   "T    - show current temperature\n\r"
+		   "D    - wait for sync with DCF\n\r"
+		   "I    - Initialize system\n\r"
+		   //		   "L    - show log so far\n\r"
 		   //		   "S    - show statistics so far\n\r"
+		   "T    - show current temperature\n\r"
+		   "U    - print UCT system time\n\r"
 		   "V    - system voltage\n\r"
 		   "X    - exit and continue the experiment\n\r"));
+		   "#    - Prepare for reinitializing the system\n\r"
 }
 
 // get temperature as an integer from a DS18S20
@@ -197,3 +213,52 @@ void process(void) {
   while (1);
 }
 
+bool waitForDCF77(void) {
+  unsigned long start = millis(), lastdot=0;
+  time_t utc;
+  int dots = 0;
+  pinMode(DCF_VCC, OUTPUT);
+  digitalWrite(DCF_VCC, HIGH);
+  pinMode(DCF_PIN, INPUT_PULLUP);
+
+  dcf.Start();
+  Serial.println("Waiting for DCF77 time ... ");
+  do {
+    utc = dcf.getUTCTime();
+    if (utc != 0) {
+      syncstart = millis();
+      setTime(utc);
+      Serial.println();
+      return true;
+    }
+    if (millis() - lastdot >= 1000) {
+      lastdot = millis();
+      Serial.print('.');
+      dots++;
+      if (dots == 60) {
+	dots = 0;
+	Serial.println();
+      }
+    }
+  } while (millis() - start <= DCF_TIMEOUT_MS);
+  Serial.println();
+  return false;
+}
+
+void printTime(time_t t) {
+  printDigits(hour(t),':');
+  printDigits(minute(t),':');
+  printDigits(second(t),' ');
+}
+
+void printDate(time_t t) {
+  printDigits(day(t),'.');
+  printDigits(month(t),'.');
+  Serial.print(year(t));
+}
+
+void printDigits(byte num, char sep) {
+  if (num < 10) Serial.print('0');
+  Serial.print(num);
+  Serial.print(sep);
+}
