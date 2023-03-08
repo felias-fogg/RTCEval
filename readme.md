@@ -34,5 +34,5 @@ The RTCs that will participate are:
 
 This is how it looks before I started to connect the RTCs to the I2C multiplexers and the MCU.
 
-  ![start](/Users/nebel/Documents/GitHub/RTCEval/pictures/start.jpg)
+  ![start](./pictures/start.jpg)
 
