@@ -1,0 +1,31 @@
+DS1307:     65.7 ppm
+DS1337:	   -42.7 ppm
+DS3231SN:    0.2 ppm (mit 35 (0x04) auf 0ppm )
+DS3231M:    -4.0 ppm (mit -310 (0xD5) auf ca. -0.2 ppm )
+MCP79410   -28.0 ppm (mit -3000 (0x9E) ca. -0.3ppm)
+PCF8523:   106.9 ppm (mit 10690 (0x9A) auf ca. 1.5ppm)
+PCF8563:    13.5 ppm
+RS5C372:    12.6 ppm (mit 1200 (0x04) auf ca. 1.5ppm)
+RV-3028:     1.5 ppm (factory calibrated auf -2 (0b111111110))
+RV-3032:     0.0 ppm 
+RV-8523:     2.8 ppm (mit Mode 1 +1 (0x81) auf ca. -2.3)
+RV-8803:     1.5 ppm (mit 75 (0x03) auf -0.3)
+SD2405:      2.3 ppm (nicht korrigierbar, da kleinste Korrektur 3pp
+	     	     ist, aber mindestens +2*3 ppm gefordert)
+
+DS1307   - 0x68
+DS1337*   - 0x68
+DS3132   - 0x68
+MCP79140 - 0x6F (and 0x57 as EEPROM)
+PCF8523  - 0x68
+PCF8563  - 0x51
+RS5C372*  - 0x32
+RV-3028  - 0x52
+RV-3032*  - 0x51
+RV-8523  - 0x68
+RV-8803  - 0x32
+SD2405*   - 0x32
+
+25LC1025 - 0x52 & 0x56,
+
+TCA9548  - 0x70 & 0x71
