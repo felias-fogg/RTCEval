@@ -24,13 +24,20 @@
 //  - commands ?, V, T, X work, I and # are just there for show
 //
 // Version 0.1.0 (8.3.2023)
-//  - command U (print UTC time), and D (wait for sync with DCF77) work now
+//  - added command U (print UTC time)
+//  - added D (wait for sync with DCF77) work now
 //
 // Version 0.2.0 (8.3.2023)
-// - command P (check presence of all devices)
+// - added command P (check presence of all devices)
+//
+// Version 0.3.0 (9.3.2023)
+// - command I (initialize) implemented,
+// - added C (show clock values);
+// - fixed: changed power-down devices to switching to INPUT mode (otherwise RV-8523 had problems)
+
 
 #define VERSION "0.2.0"
-#define BAUD 19200
+#define BAUD 115200UL
 //#define DEBUG
 
 #define INTREF 1076 // special value for this MCU 
@@ -50,6 +57,7 @@
 #define EEPROMADDR 0x50 // base address of EEPROM
 #define EEPROMADDR2 0x54 // second address of EEPROM
 
+// timeout values
 #define DCF_TIMEOUT_MS 600000UL // if no DCF77 sync after 600 secs, we give up
 #define DCF_WAIT_TIMEOUT_MS 10000UL // wait 10 seconds for at least some signal
 #define INPUT_TIMEOUT_MS 60000UL // wait 1 minute for user inputs, then contine measuring
@@ -81,6 +89,7 @@
 #include <RTC_SD2405.h>
 
 #define MAXRTC 13
+#define REFCLOCK 11 // the reference clock (it's the RV-8803)
 
 DS1307 rtc1;
 DS1337 rtc2;
@@ -134,14 +143,9 @@ void setup(void) {
   Serial.begin(BAUD);
   Serial.println();
   Serial.println(F("RTCEval V" VERSION));
-  pinMode(TEMP_VCC, OUTPUT);
-  pinMode(DCF_VCC, OUTPUT);
-  pinMode(I2C_VCC, OUTPUT);
-  pinMode(RGROUP1_VCC, OUTPUT);
-  pinMode(RGROUP2_VCC, OUTPUT);
-  digitalWrite(I2C_VCC, HIGH);
+  allVccOn();
   Wire.begin();
-  digitalWrite(I2C_VCC, LOW);
+  allVccOff();
 }
 
 void loop(void) {
@@ -163,6 +167,9 @@ void loop(void) {
   case 'H':
     help();
     break;
+  case 'C':
+    showClocks();
+    break;
   case 'D':
     if (waitForDCF77()) {
       Serial.println(F("Synced with DCF77"));
@@ -179,15 +186,17 @@ void loop(void) {
     } else {
       Serial.println(F("Already initialized! Clear first with '#'"));
     }
+    lastinput = millis();
     break;
   case 'P': checkPresence();
+    lastinput = millis();
     break;
   case 'T':
     Serial.print(F("Current temperature: "));
     Serial.println(temperature());
     break; 
   case 'U':
-    printTime(now()); printDate(now()); Serial.println(F(" UTC"));
+    printTimeDate(now()); Serial.println(F(" UTC"));
     break;
   case 'V':
     Serial.print(F("Supply voltage: "));
@@ -220,7 +229,7 @@ void loop(void) {
 
 void help(void) {
   Serial.println(F("H,?  - Help\n\r"
-		   //		   "C    - show current state of clocks\n\r"
+		   "C    - show current state of clocks\n\r"
 		   "D    - wait for sync with DCF\n\r"
 		   "I    - Initialize system\n\r"
 		   //		   "L    - show log so far\n\r"
@@ -253,17 +262,31 @@ int temperature(void) {
   }
   if (data[4] != 0xFF || data[5] != 0xFF || data[7] != 0x10) return NO_TEMP; // no sensor present 
   res = ((data[1] << 8)|data[0]);
-  digitalWrite(TEMP_VCC, LOW);
+  digitalWrite(TEMP_VCC, LOW); // power up the sensor
   return (res>>1);
 }
 
+void showClocks(void) {
+  time_t t;
+  allVccOn();
+  //Wire.begin();
+  for (byte i=0; i<MAXRTC; i++) {
+    Serial.print(F("RTC #"));
+    Serial.print(i+1);
+    Serial.println(F(": "));
+    i2cSwitchOn(rtcentry[i].multiplexer, rtcentry[i].port);
+    rtcentry[i].rtc->begin();
+    t = rtcentry[i].rtc->getTime();
+    i2cSwitchOff(rtcentry[i].multiplexer);
+    printTimeDate(t);
+    Serial.println(F(" UTC"));
+  }
+  allVccOff();
+}
+
 void checkPresence(void) {
-  digitalWrite(I2C_VCC, HIGH);
-  digitalWrite(RGROUP1_VCC, HIGH);
-  digitalWrite(RGROUP2_VCC, HIGH);
-  digitalWrite(TEMP_VCC, HIGH);
-  digitalWrite(DCF_VCC, HIGH);
-  Wire.begin();
+  allVccOn();
+  //Wire.begin();
   Serial.println(F("Devices present"));
   Serial.print(F("DCF77 module:       ")); Serial.println(testDCF());
   Serial.print(F("Temperature sensor: ")); Serial.println(temperature() != NO_TEMP);
@@ -281,11 +304,30 @@ void checkPresence(void) {
     Serial.println(rtcentry[i].rtc->begin());
     i2cSwitchOff(rtcentry[i].multiplexer);
   }
-  digitalWrite(I2C_VCC, LOW);
+  allVccOff();
+}
+
+void allVccOn(void) {
+  pinMode(I2C_VCC, OUTPUT);
+  digitalWrite(I2C_VCC, HIGH);
+  pinMode(RGROUP1_VCC, OUTPUT);
+  digitalWrite(RGROUP1_VCC, HIGH);
+  pinMode(RGROUP2_VCC, OUTPUT);
+  digitalWrite(RGROUP2_VCC, HIGH);
+  pinMode(TEMP_VCC, OUTPUT);
+  digitalWrite(TEMP_VCC, HIGH);
+  pinMode(DCF_VCC, OUTPUT);
+  digitalWrite(DCF_VCC, HIGH);
+  delay(100);
+}
+
+void allVccOff(void) {
+  delay(100);
   digitalWrite(RGROUP1_VCC, LOW);
   digitalWrite(RGROUP2_VCC, LOW);
   digitalWrite(TEMP_VCC, LOW);
   digitalWrite(DCF_VCC, LOW);
+  digitalWrite(I2C_VCC, LOW);
 }
 
 bool i2cSwitchOn(byte mpaddr, byte port) {
@@ -316,18 +358,25 @@ bool testDCF(void) {
 }
 
 void initialize(void) {
-  unsigned long start, stop;
+  unsigned long start, stop, last;
+  byte data[128];
+  bool good;
+  allVccOn();
   Serial.println(F("Setting up the experiment ..."));
   Serial.println(F("Clearing EEPROM"));
   if (!ee.begin()) {
     Serial.println(F("EEPROM not found"));
+    allVccOff();
     return;
   }
   start = millis();
   for (uint32_t i = 0; i < I2C_DEVICESIZE_24LC1025; i+=128)
   {
     if (i % 0x1000 == 0) Serial.print('.');
-    ee.setBlock(i, 0x00, 128);
+    ee.readBlock(i, data, 128);
+    good = true;
+    for (int j=0; j < 128; j++) if (data[j]) good = false;
+    if (!good) ee.setBlock(i, 0x00, 128);
   }
   stop = millis();
 
@@ -336,9 +385,26 @@ void initialize(void) {
   Serial.println(F( " sec"));
   if (!waitForDCF77()) {
     Serial.println(F("Failure!"));
+    allVccOff();
     return;
   }
+  Serial.println(F("Writing first EEPROM record"));
+  writeTime_t(0, now());
+  Serial.println(F("Setting all RTCs"));
+  for (byte i=0; i < MAXRTC; i++) {
+    Serial.print(F("Setting RTC #")); Serial.println(i+1);
+    i2cSwitchOn(rtcentry[i].multiplexer, rtcentry[i].port);
+    rtcentry[i].rtc->begin(); 
+    rtcentry[i].rtc->init();
+    if (rtcentry[i].offset) rtcentry[i].rtc->setOffset(rtcentry[i].offset,2);
+    last = now();
+    while (last == now());
+    rtcentry[i].rtc->setTime(now());
+    i2cSwitchOff(rtcentry[i].multiplexer);
+  }
   Serial.println(F("...done"));
+  dcf.Stop();
+  allVccOff();
 }
 
 void process(void) {
@@ -362,6 +428,8 @@ bool waitForDCF77(void) {
       syncstart = millis();
       setTime(utc);
       Serial.println();
+      pinMode(DCF_PIN, INPUT);
+      pinMode(DCF_VCC, INPUT);
       return true;
     }
     if (millis() - lastdot >= 1000) {
@@ -375,9 +443,17 @@ bool waitForDCF77(void) {
     }
   } while (millis() - start <= DCF_TIMEOUT_MS);
   Serial.println();
+  Serial.println(F("DFC77 receiver timeout"));
+  pinMode(DCF_PIN, INPUT);
+  digitalWrite(DCF_VCC, LOW);
   return false;
 }
 
+void printTimeDate(time_t t) {
+  printTime(t);
+  printDate(t);
+}
+ 
 void printTime(time_t t) {
   printDigits(hour(t),':');
   printDigits(minute(t),':');
@@ -394,4 +470,26 @@ void printDigits(byte num, char sep) {
   if (num < 10) Serial.print('0');
   Serial.print(num);
   Serial.print(sep);
+}
+
+void writeTime_t(unsigned long addr, time_t t) {
+  byte data[4] = { t & 0xFF, (t>>8) & 0xFF, (t>>16) & 0xFF, (t>>24) & 0xFF };
+  ee.writeBlock(addr, data, 4);
+}
+
+void writeLong(unsigned long addr, long val) {
+  byte data[4] = { val & 0xFF, (val>>8) & 0xFF, (val>>16) & 0xFF, (val>>24) & 0xFF };
+  ee.writeBlock(addr, data, 4);
+}
+
+time_t readTime_t(unsigned long addr) {
+  byte data[4];
+  ee.readBlock(addr,data,4);
+  return (data[0] | ((time_t)data[1]<<8) | ((time_t)data[1]<<16) | ((time_t)data[1]<<24));
+}
+
+long readLong(unsigned long addr) {
+  byte data[4];
+  ee.readBlock(addr,data,4);
+  return (data[0] | ((long)data[1]<<8)&0xFF00 | ((long)data[1]<<16)&0xFF0000 | ((long)data[1]<<24)&0xFF000000);
 }
