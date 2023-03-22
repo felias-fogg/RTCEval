@@ -34,9 +34,17 @@
 // - command I (initialize) implemented,
 // - added C (show clock values);
 // - fixed: changed power-down devices to switching to INPUT mode (otherwise RV-8523 had problems)
+//
+// Version 0.3.1 (21.3.2023)
+// - added: during setup, all global and local I2C busses are cleared
+// - added: timeout for I2C bus
+// - added: Wire.begin() for all functions that address the I2C bus
+// - fixed: rtc->begin() added in timedrift function
+// - added: contents of offset reg and ppms in displaying time drift
+// - added: offset reg values for initialization
 
 
-#define VERSION "0.2.0"
+#define VERSION "0.3.1"
 #define BAUD 115200UL
 //#define DEBUG
 
@@ -58,7 +66,7 @@
 #define EEPROMADDR2 0x54 // second address of EEPROM
 
 // timeout values
-#define DCF_TIMEOUT_MS 600000UL // if no DCF77 sync after 600 secs, we give up
+#define DCF_TIMEOUT_MS 360000UL // if no DCF77 sync after 360 secs, we give up
 #define DCF_WAIT_TIMEOUT_MS 10000UL // wait 10 seconds for at least some signal
 #define INPUT_TIMEOUT_MS 60000UL // wait 1 minute for user inputs, then contine measuring
 #define NO_TEMP -10000          // no legal temperatur, sensor not present
@@ -72,6 +80,7 @@
 #include <I2C_24LC1025.h>
 #include <EEPROM.h>
 #include <Vcc.h>
+#include <I2Cbus.h>
 
 #include <RTC_I2C.h>
 #include <RTC_DS1307.h>
@@ -115,17 +124,17 @@ typedef struct {
 RTCentry_t rtcentry[MAXRTC] = {
   { &rtc1,  MP2ADDR, 4, 0 }, // DS1307
   { &rtc2,  MP1ADDR, 1, 0 }, // DS1337
-  { &rtc3,  MP2ADDR, 1, 0 }, // DS3231SN
-  { &rtc4,  MP1ADDR, 6, 0 }, // DS3231M
-  { &rtc5,  MP2ADDR, 0, 0 }, // MPC79140
-  { &rtc6,  MP2ADDR, 3, 0 }, // PCF8523 
+  { &rtc3,  MP2ADDR, 1, 0x04 }, // DS3231SN
+  { &rtc4,  MP1ADDR, 6, 0xD5 }, // DS3231M
+  { &rtc5,  MP2ADDR, 0, 0x9E }, // MPC79140
+  { &rtc6,  MP2ADDR, 3, 0x9A }, // PCF8523 
   { &rtc7,  MP2ADDR, 5, 0 }, // PCF8563
-  { &rtc8,  MP1ADDR, 2, 0 }, // RS5C372
-  { &rtc9,  MP2ADDR, 2, 0 }, // RV-3028
-  { &rtc10, MP1ADDR, 3, 0 }, // RV-3032
-  { &rtc11, MP1ADDR, 4, 0 }, // RV-8523
-  { &rtc12, MP1ADDR, 5, 0 }, // RV-8803
-  { &rtc13, MP1ADDR, 0, 0 }  // SD2405
+  { &rtc8,  MP1ADDR, 2, 0x04 }, // RS5C372
+  { &rtc9,  MP2ADDR, 2, 0xFE }, // RV-3028
+  { &rtc10, MP1ADDR, 3, 0x00 }, // RV-3032
+  { &rtc11, MP1ADDR, 4, 0x81 }, // RV-8523 (note that a diode in the Vcc supply line is necessary)
+  { &rtc12, MP1ADDR, 5, 0x03 }, // RV-8803
+  { &rtc13, MP1ADDR, 0, 0x00 }  // SD2405
 };
 
 OneWire ds(TEMP_PIN);
@@ -144,6 +153,8 @@ void setup(void) {
   Serial.println();
   Serial.println(F("RTCEval V" VERSION));
   allVccOn();
+  Wire.setWireTimeout(10000);
+  clearAllI2C(); // clear all local I2C busses
   Wire.begin();
   allVccOff();
 }
@@ -169,14 +180,14 @@ void loop(void) {
     break;
   case 'C':
     showClocks();
+    lastinput = millis();
     break;
   case 'D':
-    if (waitForDCF77()) {
-      Serial.println(F("Synced with DCF77"));
-    } else {
-      Serial.println(F("Sync with DCF77 impossible"));
-    }
+    measureTimeDrift();
     lastinput = millis();
+    break;
+  case 'E':
+    testEEPROM();
     break;
   case 'I':
     EEPROM.get(0,magic);
@@ -203,6 +214,14 @@ void loop(void) {
     Serial.print(Vcc::measure(500,INTREF));
     Serial.println(F(" mV"));
     break;
+  case 'W':
+    if (waitForDCF77()) {
+      Serial.println(F("Synced with DCF77"));
+    } else {
+      Serial.println(F("Sync with DCF77 impossible"));
+    }
+    lastinput = millis();
+    break;
   case 'X':
     process();
     // we do not return here
@@ -228,16 +247,17 @@ void loop(void) {
 }
 
 void help(void) {
-  Serial.println(F("H,?  - Help\n\r"
+  Serial.println(F("H,?  - provide help text\n\r"
 		   "C    - show current state of clocks\n\r"
-		   "D    - wait for sync with DCF\n\r"
-		   "I    - Initialize system\n\r"
+		   "D    - measure time drift\n\r"
+		   "I    - initialize system\n\r"
 		   //		   "L    - show log so far\n\r"
 		   "P    - test for presence of all devices\n\r" 
 		   //		   "S    - show statistics so far\n\r"
 		   "T    - show current temperature\n\r"
 		   "U    - print UCT system time\n\r"
 		   "V    - system voltage\n\r"
+		   "W    - wait for sync with DCF\n\r"
 		   "X    - exit and continue the experiment\n\r"
 		   "#    - Prepare for reinitializing the system\n\r"));
 }
@@ -266,29 +286,39 @@ int temperature(void) {
   return (res>>1);
 }
 
+// show time of all clocks
 void showClocks(void) {
   time_t t;
+  bool valid;
   allVccOn();
-  //Wire.begin();
+  Wire.begin();
+  Serial.print(F("DCF77:  "));
+  printDateTime(now());
+  Serial.println(F(" UTC"));
   for (byte i=0; i<MAXRTC; i++) {
     Serial.print(F("RTC #"));
     Serial.print(i+1);
-    Serial.println(F(": "));
+    Serial.print(F(": "));
     i2cSwitchOn(rtcentry[i].multiplexer, rtcentry[i].port);
     rtcentry[i].rtc->begin();
     t = rtcentry[i].rtc->getTime();
+    valid = rtcentry[i].rtc->isValid();
     i2cSwitchOff(rtcentry[i].multiplexer);
     printTimeDate(t);
-    Serial.println(F(" UTC"));
+    Serial.print(F(" UTC"));
+    if (!valid) Serial.println(F(" ?"));
+    else Serial.println();
   }
   allVccOff();
 }
 
+
 void checkPresence(void) {
   allVccOn();
-  //Wire.begin();
+  Wire.begin();
   Serial.println(F("Devices present"));
-  Serial.print(F("DCF77 module:       ")); Serial.println(testDCF());
+  Serial.print(F("DCF77 module:       ")); Serial.
+					     println(testDCF());
   Serial.print(F("Temperature sensor: ")); Serial.println(temperature() != NO_TEMP);
   for (byte i=0; i < 2; i++) {
     Serial.print(F("I2C multiplexer #")); Serial.print(i+1); Serial.print(F(": "));
@@ -305,6 +335,62 @@ void checkPresence(void) {
     i2cSwitchOff(rtcentry[i].multiplexer);
   }
   allVccOff();
+}
+
+
+
+void measureTimeDrift(void) {
+  time_t absstart;
+  long drift;
+  float ppm;
+
+  allVccOn();
+  Wire.begin();
+  absstart = readTime_t(0);
+  Serial.print(elapsedDays((now()-absstart)));
+  Serial.println(F(" days since start"));
+  for (byte i=0; i<MAXRTC; i++) {
+    drift = timeDrift(i);
+    Serial.print(F("RTC #"));
+    Serial.print(i+1);
+    Serial.print(F(": "));
+    Serial.print(drift);
+    Serial.print(F("ms / "));
+    Serial.print(((float)drift)*10e3/(now()-absstart),2);
+    Serial.print(F("ppm (0x"));
+    i2cSwitchOn(rtcentry[i].multiplexer, rtcentry[i].port);
+    Serial.print(rtcentry[i].rtc->getOffset(),HEX);
+    i2cSwitchOff(rtcentry[i].multiplexer);
+    Serial.println(')');
+  }
+  allVccOff();
+}
+
+// compute time drift for one RTC
+// assume all supply lines are enabled
+// assume that we have synchronized with DCF77 before 
+long timeDrift(byte ix) {
+  time_t stop, start;
+  unsigned long startms, stopms, diff;
+
+  // enable port
+  i2cSwitchOn(rtcentry[ix].multiplexer, rtcentry[ix].port);
+  // wait until we start a new second
+  start = now();
+  while (start == now());
+  start = now();
+  startms = millis();
+
+  // now wait until the RTC starts a new second
+  rtcentry[ix].rtc->begin(); // init
+  stop = rtcentry[ix].rtc->getTime(true); // blocked call
+  stopms = millis();
+
+  // now compute the difference in ms
+  diff = (stop - start)*1000-(stopms - startms);
+
+  i2cSwitchOff(rtcentry[ix].multiplexer);
+  return diff;
 }
 
 void allVccOn(void) {
@@ -357,6 +443,23 @@ bool testDCF(void) {
   return false;
 }
 
+void clearAllI2C(void) {
+  int i2cres;
+  if (I2Cbus_clear(A4, A5) < 0) Serial.println(F("Cannot clear global bus"));
+  for (byte i=0; i < MAXRTC; i++) {
+    Wire.begin(); // enable 
+    i2cSwitchOn(rtcentry[i].multiplexer, rtcentry[i].port);
+    i2cres = I2Cbus_clear(A4, A5);
+    if (i2cres < 0 || i2cres == 2) {
+      Serial.print(F("I2C bus for RTC#")); Serial.print(i+1);
+      if (i2cres < 0) Serial.println(F(" stuck"));
+      else Serial.println(F(" recovered"));
+    }
+    Wire.begin(); // enable again
+    i2cSwitchOff(rtcentry[i].multiplexer);
+  }
+}
+
 void initialize(void) {
   unsigned long start, stop, last;
   byte data[128];
@@ -396,10 +499,14 @@ void initialize(void) {
     i2cSwitchOn(rtcentry[i].multiplexer, rtcentry[i].port);
     rtcentry[i].rtc->begin(); 
     rtcentry[i].rtc->init();
-    if (rtcentry[i].offset) rtcentry[i].rtc->setOffset(rtcentry[i].offset,2);
+    rtcentry[i].rtc->setOffset(rtcentry[i].offset,2);
     last = now();
     while (last == now());
+    /* Serial.print("Diff before: ");
+       Serial.println((millis()-syncstart)%1000); */
     rtcentry[i].rtc->setTime(now());
+    /*    Serial.print("Diff after:  ");
+	  Serial.println((millis()-syncstart)%1000); */
     i2cSwitchOff(rtcentry[i].multiplexer);
   }
   Serial.println(F("...done"));
@@ -473,23 +580,35 @@ void printDigits(byte num, char sep) {
 }
 
 void writeTime_t(unsigned long addr, time_t t) {
-  byte data[4] = { t & 0xFF, (t>>8) & 0xFF, (t>>16) & 0xFF, (t>>24) & 0xFF };
+  byte data[4] = { (byte)(t & 0xFF), (byte)((t>>8) & 0xFF), (byte)((t>>16) & 0xFF), (byte)((t>>24) & 0xFF) };
+  /*  Serial.println();
+  Serial.println((byte)(t & 0xFF),HEX);
+  Serial.println((byte)((t>>8) & 0xFF),HEX);
+  Serial.println((byte)((t>>16) & 0xFF),HEX);
+  Serial.println((byte)((t>>24) & 0xFF),HEX); */
   ee.writeBlock(addr, data, 4);
 }
 
 void writeLong(unsigned long addr, long val) {
-  byte data[4] = { val & 0xFF, (val>>8) & 0xFF, (val>>16) & 0xFF, (val>>24) & 0xFF };
+  byte data[4] = {  (byte)(val & 0xFF),  (byte)((val>>8) & 0xFF),
+		    (byte)((val>>16) & 0xFF),  (byte)((val>>24) & 0xFF) };
   ee.writeBlock(addr, data, 4);
 }
 
 time_t readTime_t(unsigned long addr) {
   byte data[4];
   ee.readBlock(addr,data,4);
-  return (data[0] | ((time_t)data[1]<<8) | ((time_t)data[1]<<16) | ((time_t)data[1]<<24));
+  /*  Serial.println();
+  Serial.println(data[0],HEX);
+  Serial.println(data[1],HEX);
+  Serial.println(data[2],HEX);
+  Serial.println(data[3],HEX); */
+  return ((time_t)data[0] | (((time_t)data[1])<<8) | (((time_t)data[2])<<16) | (((time_t)data[3])<<24));
 }
 
 long readLong(unsigned long addr) {
   byte data[4];
   ee.readBlock(addr,data,4);
-  return (data[0] | ((long)data[1]<<8)&0xFF00 | ((long)data[1]<<16)&0xFF0000 | ((long)data[1]<<24)&0xFF000000);
+  return ((long)data[0] | (((long)data[1]<<8)&0xFF00L) |
+	  (((long)data[1]<<16)&0xFF0000L) | (((long)data[1]<<24)&0xFF000000L));
 }
