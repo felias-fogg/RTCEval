@@ -1,3 +1,4 @@
+00 DS1307(Ada):18.2 ppm 
 01 DS1307:     65.7 ppm
 02 DS1337:    -42.7 ppm
 03 DS3231SN:    0.2 ppm (mit 35 (0x04) auf 0ppm )
@@ -6,7 +7,7 @@
 06 PCF8523:   106.9 ppm (mit 10690 (0x9A) auf ca. 1.5ppm)
 07 PCF8563:    13.5 ppm
 08 RS5C372:    12.6 ppm (mit 1200 (0x04) auf ca. 1.5ppm)
-09 RV-3028:     1.5 ppm (factory calibrated auf -2 (0b111111110))
+09 RV-3028:     3.8 ppm (mit 0x1FC auf ca. -0.4)
 10 RV-3032:     0.0 ppm 
 11 RV-8523:     2.8 ppm (mit Mode 1 +1 (0x81) auf ca. -2.3)
 12 RV-8803:     1.5 ppm (mit 75 (0x03) auf -0.3)
