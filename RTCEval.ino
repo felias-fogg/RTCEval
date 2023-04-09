@@ -12,7 +12,7 @@
 // time_t UTC time marker, when the record was started (could be all bits set when no DCF77 connection)
 // 14 deviation values (as signed long in msec), also initially in order to be able to normalize!
 // 24 temperature readings as signed one byte values for the current hour and then each following hour
-// temperatures 0 degrees or lower are stored as temp-1, i.e., 0 means unused, or no valid temperature.
+// temperatures. 0 degrees or lower are stored as temp-1, i.e., 0 means unused, or no valid temperature.
 // = 84 bytes
 // Since there are 128 kByte available, this means 1560 records (or more than 4 years).
 // 
@@ -51,10 +51,28 @@
 // - added: switch off RTC alarm when de-initializing
 // - added: check whether logging is necessary after (re-)start (based on IRQ flag)
 // - added: rtc0 - another DS1307
+//
+// Version 0.5.0
+// - added: E command - show (internal) EEPROM contents
+// - added: M command - show memory block
+// - fixed: bug in readLong
+// - added: TESTING option - for activating E,R,M commands
+// - added: R command - show RTC reg of reference RTC
+// - fixed: uptime days/hours are computed with respect to initial Unix time stamp
+// - changed: alarm minute is now set as the next minute after everything has been completed.
+// - added: first temperature measurement is stored in initialize routine
+// - changed: case updays==0 && uphours==0 ignored in checkLogging (since handled in initialize)
+// - changed: initial timedrift is displayed without subtracting initial drift
+//
+// Version 0.5.1
+// - changed: write '1' as a marker when DCF sync has not been achieved
+// - changed: resync with reference RTC when no DCF sync
 
-#define VERSION "0.4.0"
+
+#define VERSION "0.5.1"
 #define BAUD 115200UL
 //#define DEBUG
+#define TESTING
 
 #define INTREF 1076 // special value for this MCU 
 
@@ -76,6 +94,7 @@
 #define EEPROMADDR2 0x54 // second address of EEPROM
 
 // timeout values
+#define TERM_INPUT_TIMEOUT_MS 15000UL // wait this time for a terminal input, when a number is called for 
 #define DCF_TIMEOUT_MS 360000UL // if no DCF77 sync after 360 secs, we give up
 #define DCF_WAIT_TIMEOUT_MS 10000UL // wait 10 seconds for at least some signal
 #define INPUT_TIMEOUT_MS 60000UL // wait 1 minute for user inputs, then contine measuring
@@ -83,8 +102,9 @@
 
 // EEPROM addresses
 #define MAGIC_ADDR 0 // address, where magic 4-byte value is stored
-#define STARTHOUR_ADDR 4 // address, where the start hour is stored
-#define STARTDAY_ADDR 6 // address, where the start day is stored
+#define STARTTIME_ADDR 4 // address, where the start time (Unix format) is stored (before everything is set & stored)
+#define STARTMINUTE_ADDR 8 // address for minute for experiment start (when we we are done with setting everything)
+#define STARTHOUR_ADDR 10 // address for start hour (when we we are done with setting everything)
 
 // I2C EEPROM addresses 
 #define RECLEN 84 // length of one record
@@ -123,8 +143,8 @@
 #define MAXRTC 14
 #define REFRTC 12 // index of the reference clock (it's the RV-8803)
 
-DS1307 rtc0;
-DS1307 rtc1;
+DS1307 rtc0; // Adafruit
+DS1307 rtc1; // Elecrow
 DS1337 rtc2;
 DS3231 rtc3; // SN version
 DS3231 rtc4; // M  version
@@ -146,10 +166,10 @@ typedef struct {
 } RTCentry_t;
 
 RTCentry_t rtcentry[MAXRTC] = {
-  { &rtc0,  MP1ADDR, 7, 0 },
+  { &rtc0,  MP1ADDR, 7, 0 }, // DS1307 (Adafruit)
   { &rtc1,  MP2ADDR, 4, 0 }, // DS1307
   { &rtc2,  MP1ADDR, 1, 0 }, // DS1337
-  { &rtc3,  MP2ADDR, 1, 0x04 }, // DS3231SN
+  { &rtc3,  MP2ADDR, 1, 0x04 }, // DS3231SN (Adafruit)
   { &rtc4,  MP1ADDR, 6, 0xD5 }, // DS3231M
   { &rtc5,  MP2ADDR, 0, 0x9E }, // MPC79140
   { &rtc6,  MP2ADDR, 3, 0x9A }, // PCF8523 
@@ -173,11 +193,13 @@ unsigned long syncstart = 0;
 unsigned long lastinput = 0;
 unsigned long magic;
 int updays = -1, uphours = -1;
+int startminute;
 int starthour;
-time_t startday;
+time_t starttime;
 
 
 void setup(void) {
+  time_t diff;
   time_t curr;
   Serial.begin(BAUD);
   Serial.println();
@@ -190,12 +212,11 @@ void setup(void) {
   // read time from ref clock
   i2cSwitchOn(rtcentry[REFRTC].multiplexer, rtcentry[REFRTC].port);
   rtcentry[REFRTC].rtc->begin();
-  curr = rtcentry[REFRTC].rtc->getTime(true);
+  curr = rtcentry[REFRTC].rtc->getTime(true); // return current time (blocked to start of second)
   setTime(curr); // set time synchronized with the reference RTC (will be used when no DCF77 sync is possible)
   i2cSwitchOff(rtcentry[REFRTC].multiplexer);
   printTimeDate(now());
   Serial.println(F(" UTC"));
-  allVccOff();
   // switch on DCF77 module
   pinMode(DCF_VCC, OUTPUT);
   digitalWrite(DCF_VCC, HIGH);
@@ -203,22 +224,26 @@ void setup(void) {
   dcf.Start();
   // allow for RTC IRQ
   pinMode(RTC_IRQ_PIN, INPUT_PULLUP);
+  EEPROM.get(STARTTIME_ADDR, starttime);
+  EEPROM.get(STARTMINUTE_ADDR, startminute);
   EEPROM.get(STARTHOUR_ADDR, starthour);
-  EEPROM.get(STARTDAY_ADDR, startday);
   EEPROM.get(MAGIC_ADDR,magic);
   if (magic == MAGIC) {
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-      uphours = (hour()-starthour+24)%24;
-      updays = elapsedDays(now()-startday);
+      diff = now()-starttime;
+      uphours = (diff/SECS_PER_HOUR)%24;
+      updays = (diff/SECS_PER_DAY);
     }
     Serial.print(F("Uptime: ")); Serial.print(updays); Serial.print(F(" days and "));
     Serial.print(uphours); Serial.println(F(" hours"));
   }
   checkLogging();
+  lastinput = millis();
 }
 
 void loop(void) {
   char c = '\0';
+  long addr;
   Serial.print(F("cmd: "));
   while (c <= ' ') {
     while (!Serial.available())
@@ -230,7 +255,8 @@ void loop(void) {
     if (c > ' ') break;
   }
   lastinput = millis();
-  Serial.println(c);
+  Serial.print(c);
+  if (toupper(c) != 'M' && toupper(c) != 'R') Serial.println(); 
   switch (toupper(c)) {
   case '?':
   case 'H':
@@ -282,6 +308,22 @@ void loop(void) {
   case '#':
     uninitialize();
     break;
+#ifdef TESTING
+  case 'M': addr = parseInt();
+    Serial.println();
+    if (addr < 0) Serial.println(F("Illegal block number"));
+    else displayMemBlock(addr);
+    break;
+  case 'E':
+    displayEEPROM();
+    break;
+  case 'R':
+    addr = parseHex();
+    Serial.println();
+    if (addr < 0) Serial.println(F("Illegal register number"));
+    else displayRTCReg(addr);
+    break;
+#endif
   default:
     Serial.println(F("Illegal command"));
     break;
@@ -289,19 +331,25 @@ void loop(void) {
 }
 
 void help(void) {
-  Serial.println(F("H,?  - provide help text\n\r"
-		   "C    - show current state of clocks\n\r"
-		   "D    - measure time drift\n\r"
-		   "I    - initialize system\n\r"
+  Serial.println(F("H,?    - provide help text\n\r"
+		   "C      - show current state of clocks\n\r"
+		   "D      - measure time drift\n\r"
+		   "I      - initialize system\n\r"
 		   //		   "L    - show log so far\n\r"
-		   "P    - test for presence of all devices\n\r" 
+		   "P      - test for presence of all devices\n\r"
 		   //		   "S    - show statistics so far\n\r"
-		   "T    - show current temperature\n\r"
-		   "U    - print UCT system time\n\r"
-		   "V    - system voltage\n\r"
-		   "W    - wait for sync with DCF\n\r"
-		   "X    - exit and continue the experiment\n\r"
-		   "#    - Prepare for reinitializing the system\n\r"));
+		   "T      - show current temperature\n\r"
+		   "U      - print UCT system time\n\r"
+		   "V      - system voltage\n\r"
+		   "W      - wait for sync with DCF\n\r"
+		   "X      - exit and continue the experiment\n\r"
+		   "#      - Prepare for reinitializing the system\n\r"
+#ifdef TESTING
+		   "E      - show EEPROM params\n\r"
+		   "M<num> - display external EEPROM mem block\n\r"
+		   "R<num> - read RTC reg of reference RTC\n\r"
+#endif
+		   ));
 }
 
 // show temperature 
@@ -345,7 +393,6 @@ int temperature(void) {
 void showClocks(void) {
   time_t t;
   bool valid;
-  allVccOn();
   Wire.begin();
   Serial.print(F("System:  "));
   printTimeDate(now());
@@ -364,12 +411,10 @@ void showClocks(void) {
     if (!valid) Serial.println(F(" ?"));
     else Serial.println();
   }
-  allVccOff();
 }
 
 
 void checkPresence(void) {
-  allVccOn();
   Wire.begin();
   Serial.println(F("Devices present"));
   Serial.print(F("DCF77 module:       ")); Serial.println(testDCF());
@@ -388,7 +433,6 @@ void checkPresence(void) {
     Serial.println(rtcentry[i].rtc->begin());
     i2cSwitchOff(rtcentry[i].multiplexer);
   }
-  allVccOff();
 }
 
 
@@ -396,15 +440,13 @@ void checkPresence(void) {
 // store it in the appropriate record if day parameter >= 0
 // store also current time, if day > 0
 void showTimeDrift(int day) { 
-  time_t absstart, curr;
+  time_t absstart;
   long drift;
 
-  allVccOn();
   Wire.begin();
   absstart = readTime_t(0);
-  curr = now();
   if (day < 0) {
-    Serial.print(elapsedDays((curr-absstart+3599)));
+    Serial.print(updays);
     Serial.println(F(" days since start"));
   } else if (day == 0) {
     Serial.println(F("Store initial drift"));
@@ -415,6 +457,8 @@ void showTimeDrift(int day) {
   }    
   for (byte i=0; i<MAXRTC; i++) {
     drift = timeDrift(i);
+    if (day >=0) writeLong(day*RECLEN+(i+1)*4,drift);
+    if (day != 0) drift = drift - readTime_t(4+(i*4)); // subtract initial drift (execept for initial)
     Serial.print(F("RTC #"));
     Serial.print(i);
     Serial.print(F(": "));
@@ -426,9 +470,7 @@ void showTimeDrift(int day) {
     Serial.print(rtcentry[i].rtc->getOffset(),HEX);
     i2cSwitchOff(rtcentry[i].multiplexer);
     Serial.println(')');
-    if (day >=0) writeLong(day*RECLEN+(i+1)*4,drift);
   }
-  allVccOff();
 }
 
 // compute time drift for one RTC
@@ -528,12 +570,10 @@ void initialize(void) {
   time_t starttime;
   byte data[128];
   bool good;
-  allVccOn();
   Serial.println(F("Setting up the experiment ..."));
   Serial.println(F("Clearing EEPROM"));
   if (!ee.begin()) {
     Serial.println(F("EEPROM not found"));
-    allVccOff();
     return;
   }
   start = millis();
@@ -552,14 +592,12 @@ void initialize(void) {
   Serial.println(F( " sec"));
   if (!waitForDCF77()) {
     Serial.println(F("Failure!"));
-    allVccOff();
     return;
   }
   Serial.println(F("Writing first EEPROM record"));
   starttime = now();
   writeTime_t(0, starttime);
-  EEPROM.put(STARTDAY_ADDR, starttime-(starttime%SECS_PER_DAY));
-  EEPROM.put(STARTHOUR_ADDR, hour(starttime));
+  EEPROM.put(STARTTIME_ADDR, starttime);
   Serial.println(F("Setting all RTCs"));
   for (byte i=0; i < MAXRTC; i++) {
     Serial.print(F("Setting RTC #")); Serial.println(i);
@@ -579,14 +617,25 @@ void initialize(void) {
   }
   Serial.println(F("...done"));
   showTimeDrift(0);
-  i2cSwitchOn(rtcentry[REFRTC].multiplexer, rtcentry[REFRTC].port);
-  rtcentry[REFRTC].rtc->begin();
-  rtcentry[REFRTC].rtc->setAlarm(0); // set alarm for each beginning of an hour
-  rtcentry[REFRTC].rtc->enableAlarm(); // enable alarm
-  i2cSwitchOff(rtcentry[REFRTC].multiplexer);
-  allVccOff();
+  showTemperature(0,0);
   magic = MAGIC;
   EEPROM.put(MAGIC_ADDR, magic); // mark that we are initialized
+  starthour = hour();
+  startminute = minute()+1;
+  if (startminute == 60) {
+    startminute = 0;
+    starthour = (starthour+1)%24;
+  }
+  EEPROM.put(STARTHOUR_ADDR, starthour);
+  EEPROM.put(STARTMINUTE_ADDR, startminute);
+  i2cSwitchOn(rtcentry[REFRTC].multiplexer, rtcentry[REFRTC].port);
+  rtcentry[REFRTC].rtc->begin();
+  rtcentry[REFRTC].rtc->clearAlarm(); // clear alarm (just to be sure)
+  rtcentry[REFRTC].rtc->setAlarm(startminute); // set alarm 
+  rtcentry[REFRTC].rtc->enableAlarm(); // enable alarm
+  i2cSwitchOff(rtcentry[REFRTC].multiplexer);
+  uphours = 0;
+  updays = 0;
 }
 
 void uninitialize(void) {
@@ -601,27 +650,28 @@ void uninitialize(void) {
   if ('Y' == toupper(c)) {
     magic = 0xFFFFFFFF;
     EEPROM.put(MAGIC_ADDR, magic);
-    allVccOn();
     i2cSwitchOn(rtcentry[REFRTC].multiplexer, rtcentry[REFRTC].port);
     rtcentry[REFRTC].rtc->begin();
     rtcentry[REFRTC].rtc->clearAlarm(); // clear alarm    
     rtcentry[REFRTC].rtc->disableAlarm(); // disable alarm
     i2cSwitchOff(rtcentry[REFRTC].multiplexer);
-    allVccOff();
     Serial.println(F("System has been un-initialized!"));
   } else Serial.println(F("Nothing done"));
 }
 
 void process(void) {
   dcf.Stop();
-  attachInterrupt(digitalPinToInterrupt(RTC_IRQ_PIN), rtcWakeup, LOW);
   pinMode(DCF_PIN, INPUT);
   pinMode(DCF_VCC, INPUT);
   allVccOff();
+  Wire.end();
   Serial.println(F("\n\rContinuing experiment ..."));
   ADCSRA = 0;
   delay(1000); // wait for finishing printout
+  attachInterrupt(digitalPinToInterrupt(RTC_IRQ_PIN), rtcWakeup, LOW);
   LowPower.powerDown(SLEEP_FOREVER, ADC_ON, BOD_ON);
+  Serial.println(F("\nWoken up"));
+  delay(1000); // wait until print to terminal ended
   wdt_enable(WDTO_15MS);
   while (1); // force reset
 }
@@ -694,6 +744,8 @@ void writeTime_t(unsigned long addr, time_t t) {
 void writeLong(unsigned long addr, long val) {
   byte data[4] = {  (byte)(val & 0xFF),  (byte)((val>>8) & 0xFF),
 		    (byte)((val>>16) & 0xFF),  (byte)((val>>24) & 0xFF) };
+  /*  Serial.print(F("writeLong: ")); Serial.print(val); Serial.print('/'); Serial.println(val,HEX);
+      Serial.print(F("bytes: ")); Serial.print(data[0], HEX); Serial.print(' '); Serial.print(data[1], HEX); Serial.print(' '); Serial.print(data[2], HEX); Serial.print(' '); Serial.println(data[3], HEX); */
   ee.writeBlock(addr, data, 4);
 }
 
@@ -710,40 +762,152 @@ time_t readTime_t(unsigned long addr) {
 
 long readLong(unsigned long addr) {
   byte data[4];
+  long val;
   ee.readBlock(addr,data,4);
-  return ((long)data[0] | (((long)data[1]<<8)&0xFF00L) |
-	  (((long)data[1]<<16)&0xFF0000L) | (((long)data[1]<<24)&0xFF000000L));
+  val = ((long)data[0] | (((long)data[1]<<8)&0xFF00L) |
+	 (((long)data[2]<<16)&0xFF0000L) | (((long)data[3]<<24)&0xFF000000L));
+  /*  Serial.print(F("readLong: ")); Serial.print(val); Serial.print('/'); Serial.println(val,HEX);
+  Serial.print(F("bytes: ")); Serial.print(data[0], HEX); Serial.print(' '); Serial.print(data[1], HEX); Serial.print(' '); Serial.print(data[2], HEX); Serial.print(' '); Serial.println(data[3], HEX); */
+  return val;
 }
+
+int8_t readInt8(unsigned long addr) {
+  return (int8_t)(ee.readByte(addr));
+}
+
+    
 
 // check whether we have something to log
 // if so, do it!
 void checkLogging(void) {
   bool alarm;
   bool dcf77on;
-  allVccOn();
-  i2cSwitchOn(rtcentry[REFRTC].multiplexer, rtcentry[REFRTC].port);
-  rtcentry[REFRTC].rtc->begin();
-  alarm = rtcentry[REFRTC].rtc->senseAlarm();
-  i2cSwitchOff(rtcentry[REFRTC].multiplexer);
-  if (!alarm) {
-    allVccOff();
-    return;
-  }
-  Serial.println(F("Logging ..."));
-  if (uphours != 0) {
-    showTemperature(updays, uphours);
-  } else { // start a new day record
-    dcf77on = waitForDCF77();
-    if (dcf77on) 
-      writeTime_t((unsigned long)updays*RECLEN,now());
-    else
-      writeTime_t((unsigned long)updays*RECLEN,0); // if no DCF77 time, write 0 as a marker!
-    showTimeDrift(updays);
-    showTemperature(updays, uphours);
+  if ((magic == MAGIC) && (uphours != 0 || updays != 0)) {
+    // only if experiment started and not first hour
+    i2cSwitchOn(rtcentry[REFRTC].multiplexer, rtcentry[REFRTC].port);
+    rtcentry[REFRTC].rtc->begin();
+    alarm = rtcentry[REFRTC].rtc->senseAlarm();
+    i2cSwitchOff(rtcentry[REFRTC].multiplexer);
+    if (!alarm) { // if no alarm has been rasied, then return
+      return;
+    }
+    Serial.println(F("Logging ..."));
+    if (uphours != 0) {
+      showTemperature(updays, uphours);
+    } else { // start a new day record
+      dcf77on = waitForDCF77();
+      if (dcf77on) 
+	writeTime_t((unsigned long)updays*RECLEN,now());
+      else {
+	writeTime_t((unsigned long)updays*RECLEN,1); // if no DCF77 time, write 1 as a marker!
+	i2cSwitchOn(rtcentry[REFRTC].multiplexer, rtcentry[REFRTC].port);
+	rtcentry[REFRTC].rtc->begin();
+	setTime(rtcentry[REFRTC].rtc->getTime(true));
+	i2cSwitchOff(rtcentry[REFRTC].multiplexer);
+      }
+      showTimeDrift(updays);
+      showTemperature(updays, uphours);
+    }
   }
   i2cSwitchOn(rtcentry[REFRTC].multiplexer, rtcentry[REFRTC].port);
   rtcentry[REFRTC].rtc->begin();
   rtcentry[REFRTC].rtc->clearAlarm();
   i2cSwitchOff(rtcentry[REFRTC].multiplexer);
-  allVccOff();
+  process();
 }
+
+void displayEEPROM(void) {
+  Serial.print(F("Start time: ")); printTimeDate(starttime); Serial.println();
+  Serial.print(F("Start hour: ")); Serial.println(starthour);
+  Serial.print(F("Start min:  ")); Serial.println(startminute);
+}
+
+void displayMemBlock(unsigned int rec) {
+  time_t begin;
+  long dev;
+  int8_t temp;
+  begin = readTime_t(rec*RECLEN);
+  Serial.print(F("Begin: ")); printTimeDate(begin); Serial.print(F(" (")); Serial.print(begin); Serial.println(F(")"));
+  for (byte i=0; i < MAXRTC; i++) {
+    dev = readLong(rec*RECLEN+(i+1)*4);
+    Serial.print(F("Dev #"));
+    printDigits(i, '\0');
+    Serial.print(F(": "));
+    Serial.println(dev);
+  }
+  Serial.print(F("Temps: "));
+  for (byte i=0; i < 24; i++) {
+    temp = readInt8((rec*RECLEN)+TMPSTART+i);
+    if (temp == 0) Serial.print(F("---"));
+    else if (temp == -1) Serial.print(F("  0"));
+    else if (temp < -1) {
+      Serial.print('-');
+      printDigits(temp+1, '\0');
+    } else {
+      Serial.print(' ');
+      printDigits(temp, '\0');
+    }
+    Serial.print(' ');
+  }
+  Serial.println();
+}
+
+long parseInt(void) {
+  int c = -1;
+  unsigned long start= millis();
+  long res = 0;
+  bool sign = false, numstart = false;
+
+  while (millis() - start < TERM_INPUT_TIMEOUT_MS) {
+    c = Serial.read();
+    if (c < 0) continue;
+    Serial.print((char)c);
+    start = millis();
+    if (!numstart) {
+      if (!isDigit(c) && c != '-' && c != '+') continue;
+      else {
+	numstart = true;
+	if (c == '-' || c == '+') {
+	  sign = ( c == '-' );
+	  continue;
+	}
+      }
+    }
+    if (isdigit(c)) res = res*10 + c - '0';
+    else return(sign ? -res : res);
+  }
+  return -1;
+}
+	  
+
+void displayRTCReg(int reg) {
+  byte val;
+  i2cSwitchOn(rtcentry[REFRTC].multiplexer, rtcentry[REFRTC].port);
+  rtcentry[REFRTC].rtc->begin();
+  val = rtcentry[REFRTC].rtc->getRegister((byte)reg);
+  i2cSwitchOff(rtcentry[REFRTC].multiplexer);
+  Serial.print(F("RTC reg: 0x")); Serial.println(val,HEX);
+}
+
+int checkHex(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  else if (toupper(c) >= 'A' && toupper(c) <= 'F') return toupper(c) - 'A' + 10;
+  else return -1;
+}
+  
+int parseHex(void) {
+  int c = -1;
+  unsigned long start= millis();
+  long res = 0;
+
+  while (millis() - start < TERM_INPUT_TIMEOUT_MS) {
+    c = Serial.read();
+    if (c < 0) continue;
+    Serial.print((char)c);
+    start = millis();
+    if (checkHex(c) < 0) return res;
+    res = res*16+checkHex(c);
+  }
+  return -1;
+}
+	  
